@@ -219,12 +219,50 @@ def build_chat_srt(
     return "\n".join(cues)
 
 
-def cut_clip(rec_path: Path, start: float, duration: float, out_path: Path) -> bool:
-    """Cut [start, start + duration] out of the recording, center-cropped to 9:16."""
+Facecam = Tuple[float, float, float, float]  # x, y, w, h as fractions of the frame
+
+STACK_W, STACK_H, STACK_FACE_H = 1080, 1920, 768  # facecam panel is the top 40%
+
+
+def parse_facecam(value: str) -> Facecam:
+    """'x:y:w:h' as fractions of the frame, e.g. '0:0.425:0.2:0.225'."""
+    try:
+        x, y, w, h = (float(part) for part in value.split(":"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected x:y:w:h, e.g. 0:0.425:0.2:0.225")
+    if not (0 <= x < 1 and 0 <= y < 1 and 0 < w <= 1 - x and 0 < h <= 1 - y):
+        raise argparse.ArgumentTypeError("x, y, w, h must be fractions that stay inside the frame")
+    return x, y, w, h
+
+
+def build_filter(facecam: Optional[Facecam]) -> Tuple[str, str]:
+    """Return (flag, value) for ffmpeg: a plain 9:16 center crop, or the
+    facecam stacked on top of a center crop of the gameplay."""
+    if facecam is None:
+        return "-vf", "crop=trunc(ih*9/16/2)*2:ih"
+    x, y, w, h = facecam
+    game_h = STACK_H - STACK_FACE_H
+    graph = (
+        "[0:v]split=2[a][b];"
+        f"[a]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},"
+        f"scale={STACK_W}:{STACK_FACE_H}:force_original_aspect_ratio=increase,"
+        f"crop={STACK_W}:{STACK_FACE_H}[face];"
+        f"[b]scale={STACK_W}:{game_h}:force_original_aspect_ratio=increase,"
+        f"crop={STACK_W}:{game_h}[game];"
+        "[face][game]vstack[v]"
+    )
+    return "-filter_complex", graph
+
+
+def cut_clip(rec_path: Path, start: float, duration: float, out_path: Path, facecam: Optional[Facecam] = None) -> bool:
+    """Cut [start, start + duration] out of the recording as 9:16: a center
+    crop, or the facecam on top of the gameplay when `facecam` is given."""
+    flag, value = build_filter(facecam)
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-ss", f"{start:.2f}", "-i", str(rec_path), "-t", f"{duration:.2f}",
-        "-vf", "crop=trunc(ih*9/16/2)*2:ih",
+        flag, value,
+        *(["-map", "[v]", "-map", "0:a?"] if facecam else []),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-c:a", "aac", "-b:a", "160k",
         "-movflags", "+faststart",
@@ -272,10 +310,11 @@ class Recorder:
 class ClipWorker(threading.Thread):
     """Runs ffmpeg off the main thread so reading chat never stalls."""
 
-    def __init__(self, args: argparse.Namespace, recorder: Recorder) -> None:
+    def __init__(self, args: argparse.Namespace, recorder: Recorder, uploader=None) -> None:
         super().__init__(name="clip-worker")
         self.args = args
         self.recorder = recorder
+        self.uploader = uploader  # youtube_upload.YouTubeUploader, or None
         self.jobs: "queue.Queue[Optional[Tuple[Clip, List[ChatMessage]]]]" = queue.Queue()
         args.clips_dir.mkdir(parents=True, exist_ok=True)
 
@@ -308,12 +347,27 @@ class ClipWorker(threading.Thread):
 
         stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(clip.spike_time))
         out = self.args.clips_dir / f"{self.args.channel}_{stamp}_{clip.peak}msgs.mp4"
-        if not cut_clip(self.recorder.path, rec_start, duration, out):
+        if not cut_clip(self.recorder.path, rec_start, duration, out, self.args.facecam):
             log(f"ffmpeg failed for {out.name}")
             return
         if self.args.srt:
             out.with_suffix(".srt").write_text(build_chat_srt(messages, wall_start, clip.wall_end), encoding="utf-8")
         log(f"clip saved: {out} ({duration:.0f} s)")
+        if self.uploader:
+            from youtube_upload import build_metadata
+
+            clip_msgs = [m for m in messages if wall_start <= m.time < clip.wall_end]
+            job = build_metadata(
+                self.args.channel,
+                clip.peak,
+                duration,
+                clip.spike_time,
+                [m.text for m in clip_msgs],
+                len({m.user for m in clip_msgs}),
+                self.args.bucket,
+            )
+            job.path = out
+            self.uploader.submit(job)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -330,7 +384,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--quality", default="best", help="streamlink quality (default best)")
     p.add_argument("--rec-dir", type=Path, default=ROOT / "rec")
     p.add_argument("--clips-dir", type=Path, default=ROOT / "clips")
+    p.add_argument("--facecam", type=parse_facecam, metavar="X:Y:W:H", help="where the streamer's webcam is, as fractions of the frame. Clips get the face on top and the gameplay below instead of a plain center crop")
     p.add_argument("--no-srt", dest="srt", action="store_false", help="don't write chat .srt files")
+    p.add_argument("--youtube", action="store_true", help="upload every clip to YouTube with a generated title and description")
+    p.add_argument("--youtube-privacy", choices=["private", "unlisted", "public"], default="private", help="privacy of uploaded videos (default private)")
+    p.add_argument("--youtube-category", default="20", help="YouTube category id (default 20 = Gaming)")
+    p.add_argument("--youtube-secrets", type=Path, default=ROOT / "client_secrets.json", help="Google OAuth client file (default client_secrets.json)")
+    p.add_argument("--youtube-token", type=Path, default=ROOT / "youtube_token.json", help="where the login token is saved (default youtube_token.json)")
     p.add_argument("-v", "--verbose", action="store_true", help="print every bucket's message count")
     return p.parse_args(argv)
 
@@ -345,14 +405,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     history: Deque[ChatMessage] = collections.deque()
     keep_seconds = args.before + args.max_len + 120
 
+    # Sign in to YouTube first, so the browser prompt doesn't appear mid-stream.
+    uploader = None
+    if args.youtube:
+        try:
+            from youtube_upload import YouTubeUploader, authenticate
+
+            youtube = authenticate(args.youtube_secrets, args.youtube_token)
+        except ImportError:
+            log("error: --youtube needs: pip install -r requirements.txt")
+            return 1
+        except Exception as err:
+            log(f"error: YouTube sign-in failed: {err}")
+            return 1
+        uploader = YouTubeUploader(youtube, args.youtube_category, args.youtube_privacy)
+        uploader.start()
+        log(f"youtube: signed in, clips upload as {args.youtube_privacy}")
+
     recorder = Recorder(args.channel, args.rec_dir, args.quality)
     try:
         recorder.start()
     except RuntimeError as err:
         log(f"error: {err}")
+        if uploader:
+            uploader.finish()
         return 1
 
-    worker = ClipWorker(args, recorder)
+    worker = ClipWorker(args, recorder, uploader)
     worker.start()
     chat = TwitchChat(args.channel)
     counter = BucketCounter(args.bucket, time.time())
@@ -400,6 +479,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         recorder.stop()
         dispatch(planner.drain())  # recording is final, cut whatever is left
         worker.finish()
+        if uploader:
+            log("youtube: waiting for uploads to finish")
+            uploader.finish()
     return 0
 
 

@@ -1,3 +1,4 @@
+import argparse
 import unittest
 
 from clip_watcher import (
@@ -6,6 +7,8 @@ from clip_watcher import (
     ClipPlanner,
     SpikeDetector,
     build_chat_srt,
+    build_filter,
+    parse_facecam,
     parse_privmsg,
     srt_time,
 )
@@ -77,6 +80,25 @@ class ClipPlannerTest(unittest.TestCase):
         self.assertEqual(len(planner.due(1035)), 1)
         later = planner.on_spike(1025, 30)  # would start at 1005, but 1010 is already cut
         self.assertEqual((later.wall_start, later.wall_end), (1010, 1035))
+
+
+class FacecamTest(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(parse_facecam("0:0.425:0.2:0.225"), (0.0, 0.425, 0.2, 0.225))
+
+    def test_parse_rejects_bad_values(self):
+        for bad in ("1:2:3", "a:b:c:d", "0.9:0:0.5:0.5", "0:0:0:0.5"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                parse_facecam(bad)
+
+    def test_filter_defaults_to_center_crop(self):
+        self.assertEqual(build_filter(None), ("-vf", "crop=trunc(ih*9/16/2)*2:ih"))
+
+    def test_filter_stacks_face_over_game(self):
+        flag, graph = build_filter((0.0, 0.4, 0.2, 0.2))
+        self.assertEqual(flag, "-filter_complex")
+        self.assertIn("crop=iw*0.2:ih*0.2:iw*0.0:ih*0.4", graph)
+        self.assertIn("vstack", graph)
 
 
 class SrtTest(unittest.TestCase):

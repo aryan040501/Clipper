@@ -53,6 +53,49 @@ Stop with Ctrl+C. Spikes that are still waiting are cut from what was recorded b
 - **Disk:** the full stream is kept in `rec/`. Delete it when you're done.
 - Clip names show the spike's peak: `clips/xqc_20261119-201502_84msgs.mp4`.
 
+## Including the streamer's face
+
+A plain 9:16 center crop cuts off the webcam, which usually sits in a corner. Pass `--facecam X:Y:W:H` to put the webcam on top (40% of the frame) and the gameplay below it (60%):
+
+```
+./watch.sh ishowspeed --facecam 0:0.425:0.2:0.225
+```
+
+The four numbers are fractions of the frame: left edge, top edge, width, height. For a 1920x1080 stream, a webcam at pixels x=0..384, y=460..703 is `0:0.426:0.2:0.226`. To find them, grab a frame and read the webcam's edges:
+
+```
+ffmpeg -sseof -20 -i rec/<file>.ts -frames:v 1 frame.png
+```
+
+There is no face detection, because that would need a model. If the streamer moves the webcam, restart with new numbers.
+
+## Upload to YouTube
+
+Add `--youtube` and every clip is uploaded as soon as it is cut:
+
+```
+./watch.sh xqc --youtube                          # uploads as private
+./watch.sh xqc --youtube --youtube-privacy public
+```
+
+One-time setup (the same login flow as the Youtube Automation project):
+
+1. `pip install -r requirements.txt`
+2. In Google Cloud, enable the YouTube Data API v3 and create an OAuth client of type **Desktop app**. Save the file as `client_secrets.json` next to `clip_watcher.py` (or pass `--youtube-secrets PATH`).
+3. Run with `--youtube`. A browser opens once to sign in. The token is saved in `youtube_token.json` and refreshed automatically after that.
+
+Both files are in `.gitignore`. Never commit them.
+
+Title and description are generated without AI from what the program saw: the channel, the chat peak, and the emotes chat used most (each counted once per message). Example:
+
+```
+xqc | Chat goes wild (KEKW, OMEGALUL) #Shorts
+```
+
+The description has the message count, the top reactions, a link to the Twitch channel for credit, and hashtags. `#Shorts` is added for clips of 3 minutes or less.
+
+Notes: uploads run in the background and finish after Ctrl+C. An upload that fails is logged and skipped. Each upload costs 1600 of the default 10,000 daily API quota units, so about 6 clips a day. Videos from a Google Cloud project that has not passed API audit are forced to private, whatever `--youtube-privacy` says.
+
 ## Subtitles (.srt) without AI
 
 There are a few ways to get subtitles without paying for AI:

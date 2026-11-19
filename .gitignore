@@ -3,3 +3,6 @@ clips/
 __pycache__/
 *.pyc
 .venv/
+client_secrets.json
+youtube_token.json
+*.pickle
