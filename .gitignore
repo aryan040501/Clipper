@@ -1,0 +1,5 @@
+rec/
+clips/
+__pycache__/
+*.pyc
+.venv/
